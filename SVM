@@ -1,0 +1,80 @@
+# air_pollution_detection.py
+import os
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import LinearSVC, SVC
+from sklearn.metrics import confusion_matrix
+import joblib   # pip install joblib (usually part of scikit-learn)
+
+# ===== USER SETTINGS =====
+DATA_PATH = r"E:\quantum computing\data set\cleaned_dataset.csv"
+USE_LINEAR = True            # True -> LinearSVC (fast). False -> SVC(kernel='rbf') (slower)
+RANDOM_STATE = 42
+MODEL_PATH = "svm_model_50k.joblib"
+SCALER_PATH = "scaler_50k.joblib"
+
+# =========================
+
+def main():
+    # 1) Load dataset
+    df = pd.read_csv(DATA_PATH)
+    print("Loaded rows:", len(df))
+
+    # 2) Select features and labels
+    X = df[["NO2 Mean", "O3 Mean", "SO2 Mean", "CO Mean"]]
+    y = df["AirQualityCategory"]
+
+    # 3) Split into train/test
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=RANDOM_STATE
+    )
+    print("Train size:", len(X_train), "Test size:", len(X_test))
+    print("Train class counts:\n", y_train.value_counts())
+
+    # 4) Standardize features
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    # 5) Create and train model
+    if USE_LINEAR:
+        model = LinearSVC(random_state=RANDOM_STATE, max_iter=20000, class_weight="balanced")
+    else:
+        model = SVC(kernel="rbf", random_state=RANDOM_STATE, class_weight="balanced", probability=False)
+
+    model.fit(X_train_scaled, y_train)
+
+    # 6) Evaluate using confusion matrix only
+    y_pred = model.predict(X_test_scaled)
+    labels = ["Good", "Moderate", "Bad"]
+
+    cm = confusion_matrix(y_test, y_pred, labels=labels)
+    print("\nConfusion Matrix (rows=actual, cols=predicted):")
+    header = "          " + "  ".join(f"{lab:>9}" for lab in labels)
+    print(header)
+    for i, row_lab in enumerate(labels):
+        row_vals = "  ".join(f"{v:>9d}" for v in cm[i])
+        print(f"{row_lab:>9}  {row_vals}")
+
+    # Calculate and print accuracy
+    accuracy = model.score(X_test_scaled, y_test)
+    print(f"\nOverall Accuracy: {accuracy * 100:.2f}%")
+
+    # 7) Show prediction distribution
+    unique, counts = np.unique(y_pred, return_counts=True)
+    total_preds = int(sum(counts))
+    print("\nPrediction distribution (on test set):")
+    for cls, count in zip(unique, counts):
+        percent = 100.0 * count / total_preds
+        print(f"{cls}: {count} samples ({percent:.2f}%)")
+
+    # 8) Save model and scaler
+    joblib.dump(model, MODEL_PATH)
+    joblib.dump(scaler, SCALER_PATH)
+    print(f"\nSaved model -> {os.path.abspath(MODEL_PATH)}")
+    print(f"Saved scaler -> {os.path.abspath(SCALER_PATH)}")
+
+if __name__ == "__main__":
+    main()
