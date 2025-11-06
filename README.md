@@ -24,7 +24,7 @@ Evaluate how a classical ML decision boundary (SVM) differs from a quantum kerne
 | Component | Used |
 |----------|------|
 | Classical | Scikit-Learn SVM |
-| Quantum   | Qiskit (QuantumKernel) or PennyLane QSVM |
+| Quantum   | Qiskit (QuantumKernel)|
 | Language  | Python |
 | Notebook  | Jupyter |
 
