@@ -1,0 +1,214 @@
+# qsvm_qiskit.py
+import os
+import numpy as np
+import pandas as pd
+import joblib
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.model_selection import train_test_split
+from sklearn.svm import SVC
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+
+# ---------------- Qiskit imports (modern API) ----------------
+try:
+    # Prefer AerSampler if qiskit-aer provides it (fast and supports statevector/qasm)
+    from qiskit_aer.primitives import AerSampler  # available if qiskit-aer installed
+    AerSampler_available = True
+except Exception:
+    AerSampler_available = False
+
+try:
+    # Generic Sampler (may be available depending on installed Qiskit packages)
+    from qiskit.primitives import Sampler
+    Sampler_available = True
+except Exception:
+    Sampler_available = False
+
+try:
+    # Use PauliFeatureMap instead of ZZFeatureMap
+    from qiskit.circuit.library import PauliFeatureMap
+except Exception as e:
+    raise ImportError(
+        "PauliFeatureMap import failed. Install/upgrade qiskit: pip install qiskit"
+    ) from e
+
+# Prefer QuantumKernel when available; fallback to FidelityQuantumKernel if needed
+try:
+    from qiskit_machine_learning.kernels import QuantumKernel
+    QuantumKernel_available = True
+except Exception:
+    QuantumKernel_available = False
+    try:
+        from qiskit_machine_learning.kernels import FidelityQuantumKernel
+    except Exception as e:
+        raise ImportError(
+            "qiskit-machine-learning kernel imports failed. Install with: pip install qiskit-machine-learning qiskit qiskit-aer"
+        ) from e
+# ------------------------------------------------------------
+
+# ===== USER SETTINGS (edit as needed) =====
+DATA_PATH = r"E:\quantum computing\data set\cleaned_dataset.csv"  # update if different
+N_SAMPLES = 500            # total samples to use (keep small: 200-1000)
+N_COMPONENTS = 3           # PCA components -> number of qubits (keep small)
+TEST_SIZE = 0.25
+RANDOM_STATE = 42
+USE_STATEVECTOR = True     # True -> deterministic statevector-like behavior (if backend supports it)
+ZZ_REPS = 2                # repetitions for feature map (kept the same name for compatibility)
+OUT_DIR = "."              # directory to save outputs
+# ==========================================
+
+def make_sampler(use_statevector=True, shots=1024, seed=None):
+    """
+    Create a sampler suitable for QuantumKernel.
+    Prefer AerSampler if available (qiskit-aer.primitives). Otherwise use qiskit.primitives.Sampler.
+    """
+    if AerSampler_available:
+        # AerSampler supports configuration for method; use 'statevector' when requested
+        try:
+            if use_statevector:
+                # AerSampler in some versions accepts method="statevector" via backend options
+                sampler = AerSampler(method="statevector")
+            else:
+                sampler = AerSampler(shots=shots, seed=seed)
+            return sampler
+        except TypeError:
+            # Fallback when signature differs
+            if use_statevector:
+                return AerSampler()
+            else:
+                return AerSampler(shots=shots)
+    elif Sampler_available:
+        # Minimal generic Sampler; may map to a simulator backend available in environment.
+        # Sampler() usually picks a default local simulator implementation.
+        return Sampler()
+    else:
+        raise ImportError(
+            "No suitable Sampler found. Please install qiskit-aer or ensure qiskit.primitives.Sampler is available.\n"
+            "Try: pip install qiskit-aer qiskit-machine-learning qiskit"
+        )
+
+def main():
+    print("Loading dataset:", DATA_PATH)
+    df = pd.read_csv(DATA_PATH)
+
+    # required columns check
+    feature_cols = ["NO2 Mean", "O3 Mean", "SO2 Mean", "CO Mean"]
+    for c in feature_cols + ["AirQualityCategory"]:
+        if c not in df.columns:
+            raise KeyError(f"Required column '{c}' not found in dataset. Columns: {df.columns.tolist()}")
+
+    X = df[feature_cols].values
+    y = df["AirQualityCategory"].values
+
+    # 2) subsample (stratified)
+    if N_SAMPLES < len(df):
+        X_sub, _, y_sub, _ = train_test_split(
+            X, y, train_size=N_SAMPLES, stratify=y, random_state=RANDOM_STATE
+        )
+    else:
+        X_sub, y_sub = X, y
+
+    print(f"Using {len(X_sub)} samples (subsampled). Class distribution:")
+    unique, counts = np.unique(y_sub, return_counts=True)
+    for u, c in zip(unique, counts):
+        print(f"  {u}: {c}")
+
+    # 3) preprocess: scale + PCA
+    scaler = StandardScaler().fit(X_sub)
+    X_scaled = scaler.transform(X_sub)
+
+    if N_COMPONENTS > X_scaled.shape[1]:
+        raise ValueError("N_COMPONENTS > number of original features. Reduce N_COMPONENTS or increase features.")
+    pca = PCA(n_components=N_COMPONENTS, random_state=RANDOM_STATE).fit(X_scaled)
+    X_pca = pca.transform(X_scaled)
+
+    # 4) train/test split on small set
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_pca, y_sub, test_size=TEST_SIZE, stratify=y_sub, random_state=RANDOM_STATE
+    )
+    print(f"Train size: {len(X_train)}, Test size: {len(X_test)}")
+
+    # 5) build quantum feature map (PauliFeatureMap now)
+    num_qubits = N_COMPONENTS
+    print(f"Building PauliFeatureMap with {num_qubits} qubits, reps={ZZ_REPS}")
+    feature_map = PauliFeatureMap(feature_dimension=num_qubits, reps=ZZ_REPS)
+
+    # 6) create sampler (modern API)
+    print("Initializing sampler for quantum kernel...")
+    try:
+        sampler = make_sampler(use_statevector=USE_STATEVECTOR, shots=1024, seed=RANDOM_STATE)
+        print(f"Sampler created: {sampler}")
+    except Exception as e:
+        raise RuntimeError("Failed to create sampler. See error below.") from e
+
+    # 7) build quantum kernel and evaluate kernel matrices
+    print("Creating Quantum Kernel (this wraps the feature map + sampler)...")
+    # Try QuantumKernel first (preferred). If not available or signature mismatch, fallback to FidelityQuantumKernel
+    if QuantumKernel_available:
+        try:
+            qkernel = QuantumKernel(feature_map=feature_map, sampler=sampler)
+        except Exception:
+            # signature mismatch or older version - try without sampler
+            qkernel = QuantumKernel(feature_map=feature_map)
+    else:
+        # fallback to FidelityQuantumKernel (older/newer naming differences)
+        qkernel = FidelityQuantumKernel(feature_map=feature_map)
+
+    print("Evaluating K_train (this may take some time)...")
+    K_train = qkernel.evaluate(x_vec=X_train, y_vec=X_train)   # shape (n_train, n_train)
+    print("Evaluating K_test (this may take some time)...")
+    K_test = qkernel.evaluate(x_vec=X_test, y_vec=X_train)     # shape (n_test, n_train)
+
+    # Optionally save kernel matrices for inspection / reuse
+    os.makedirs(OUT_DIR, exist_ok=True)
+    np.save(os.path.join(OUT_DIR, "K_train.npy"), K_train)
+    np.save(os.path.join(OUT_DIR, "K_test.npy"), K_test)
+    print(f"Saved kernel matrices to {OUT_DIR}/K_train.npy and K_test.npy")
+
+    # 8) train classical SVM with precomputed kernel
+    print("Training SVC with precomputed kernel...")
+    svm = SVC(kernel='precomputed', class_weight='balanced', random_state=RANDOM_STATE)
+    svm.fit(K_train, y_train)
+
+    # 9) predict & evaluate
+    y_pred = svm.predict(K_test)
+    acc = accuracy_score(y_test, y_pred)
+    # adjust labels order if your dataset has different categories
+    labels_order = ["Good", "Moderate", "Bad"]
+    # compute confusion matrix safely (handle missing labels)
+    try:
+        cm = confusion_matrix(y_test, y_pred, labels=labels_order)
+    except Exception:
+        # fallback: compute with unique labels seen
+        unique_labels = np.unique(np.concatenate([y_test, y_pred]))
+        cm = confusion_matrix(y_test, y_pred, labels=unique_labels)
+        labels_order = unique_labels.tolist()
+
+    print("\n=== Results ===")
+    print(f"Accuracy: {acc*100:.2f}%")
+    print("Confusion matrix (rows=actual, cols=predicted):")
+    # Print header
+    header = "    " + "  ".join(f"{lab:>8}" for lab in labels_order)
+    print(header)
+    for i, lab in enumerate(labels_order):
+        row = "  ".join(f"{cm[i, j]:6d}" for j in range(cm.shape[1]))
+        print(f"{lab:>8}  {row}")
+    print("\nClassification report:")
+    print(classification_report(y_test, y_pred, digits=4))
+
+    # 10) save artifacts
+    out_svm = os.path.join(OUT_DIR, "qkernel_svm.joblib")
+    out_kernel = os.path.join(OUT_DIR, "quantum_kernel.joblib")
+    out_scaler = os.path.join(OUT_DIR, "qkernel_scaler.joblib")
+    out_pca = os.path.join(OUT_DIR, "qkernel_pca.joblib")
+    joblib.dump(svm, out_svm)
+    joblib.dump(qkernel, out_kernel)
+    joblib.dump(scaler, out_scaler)
+    joblib.dump(pca, out_pca)
+    print(f"\nSaved SVM -> {out_svm}")
+    print(f"Saved QuantumKernel -> {out_kernel}")
+    print(f"Saved scaler -> {out_scaler}")
+    print(f"Saved PCA -> {out_pca}")
+
+if __name__ == "__main__":
+    main()
